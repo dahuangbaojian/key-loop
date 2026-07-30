@@ -4,3 +4,4 @@ build/
 dist/
 *.spec
 key_loop_config.json
+key_loop_config.json.tmp

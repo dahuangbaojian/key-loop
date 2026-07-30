@@ -1,47 +1,69 @@
 # KeyLoop 按键精灵 Lite
 
-Windows 定时按键小工具（参考 `auto_presser.py` 升级而来）。打开后有 12 个按键槽位，
-默认对应 F1~F12，每行可以自选按键、单独设置触发间隔，用全局热键一键开/关。
+KeyLoop 是一个 Windows 定时按键小工具。它提供 12 个独立按键槽位，可以为每个
+槽位选择按键、触发间隔和启用状态，并通过全局热键统一开始或停止。
 
 ## 功能
 
-- 12 个槽位，按键可选：F1~F12、数字、字母、空格、方向键等，每行独立间隔（秒）
-- 全局开关热键可自定义（默认 F8），游戏窗口聚焦时也能开/关
-- SendInput + 扫描码发送按键，大部分游戏可识别
-- 按住时长（毫秒）可调，部分游戏需要 50ms 以上才能识别
-- 配置自动保存到同目录 `key_loop_config.json`，下次打开自动恢复
-- 窗口置顶开关、全部启用/停用快捷按钮
+- 12 个独立槽位，支持 F1~F12、数字、字母、空格、方向键等
+- 每行单独设置触发间隔，多行同时到期时互不阻塞
+- 自定义全局开关热键，默认 Home，也可选择 F1~F12
+- 使用 Win32 `SendInput` 和扫描码发送按键
+- 按住时长可在 10~500 毫秒之间调整
+- 窗口置顶、全部启用和全部停用
+- 配置自动保存，并兼容旧版同目录配置
+- 停止、修改配置或退出时自动释放已按下的按键
 
-## 直接运行（Windows）
+## 直接运行
 
-无需安装任何第三方库：
+需要 Windows 以及 Python 3.8 或更高版本。程序本身只使用 Python 标准库：
 
 ```bat
 python key_loop.py
 ```
 
-## 打包成 exe（必须在 Windows 上执行）
+配置保存在：
 
-方式一：双击 `build.bat`，等待完成即可。
-
-方式二：手动执行
-
-```bat
-pip install pyinstaller
-pyinstaller -F -w -n KeyLoop key_loop.py
+```text
+%APPDATA%\KeyLoop\key_loop_config.json
 ```
 
-生成的单文件程序在 `dist\KeyLoop.exe`，双击即可使用，可单独拷给别人（对方无需装 Python）。
+如果程序目录中存在旧版 `key_loop_config.json`，首次启动时仍会读取；下一次保存会
+写入新的用户配置目录。
 
-常用可选参数：
+## 打包成 exe
 
-- 自定义图标：`pyinstaller -F -w -n KeyLoop -i icon.ico key_loop.py`
-- 默认以管理员身份启动（对管理员权限运行的游戏发键需要）：加 `--uac-admin`
-- 若杀毒软件误报，可把 `-F` 换成 `-D`（生成文件夹而不是单文件，误报率更低）
+必须在 Windows 上打包。可以双击 `build.bat`，也可以手动执行：
+
+```bat
+python -m pip install pyinstaller
+python -m PyInstaller -F -w -n KeyLoop key_loop.py
+```
+
+生成文件位于 `dist\KeyLoop.exe`。使用 exe 的用户不需要安装 Python。
+
+常用选项：
+
+- 自定义图标：增加 `-i icon.ico`
+- 默认请求管理员权限：增加 `--uac-admin`
+- 降低单文件打包的误报概率：把 `-F` 改成 `-D`
+
+## 开发与测试
+
+调度逻辑位于 `key_loop_core.py`，不依赖 Windows API，可以在任意平台运行测试：
+
+```shell
+python -m unittest discover -s tests
+python -m py_compile key_loop.py key_loop_core.py
+```
+
+GitHub Actions 会先运行测试，再在 Windows 环境构建 exe。
 
 ## 注意事项
 
-- 如果目标程序是**以管理员身份运行**的，本工具也要以管理员身份运行，否则按键发不进去（Windows UIPI 限制）。
-- 与开关热键相同的按键行不会被触发（防止自己把自己关掉）。
-- 部分带反作弊的游戏可能会屏蔽模拟按键，属于正常现象。
-- 请在游戏规则允许的范围内使用。
+- 如果目标程序以管理员身份运行，KeyLoop 通常也需要以管理员身份运行，否则会受到
+  Windows UIPI 限制。
+- 与开关热键相同的按键行会被忽略，避免模拟按键触发自身开关。
+- 当间隔小于按住时长时，会在上一次松键后尽快再次触发。
+- 部分带反作弊的软件会屏蔽模拟按键。
+- 请在目标软件或游戏规则允许的范围内使用。

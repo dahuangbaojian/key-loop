@@ -26,6 +26,7 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
+MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 GA_ROOT = 2
@@ -142,6 +143,15 @@ def send_mouse_event(flags):
     return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
 
 
+def send_mouse_move(dx, dy):
+    """发送相对鼠标移动，用于让游戏进入右键视角输入状态。"""
+
+    union = InputUnion()
+    union.mi = MouseInput(dx, dy, 0, MOUSEEVENTF_MOVE, 0, 0)
+    event = Input(INPUT_MOUSE, union)
+    return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
+
+
 def send_right_click(hold_s, shutdown_event):
     """发送一次完整右键点击。"""
 
@@ -197,6 +207,8 @@ KEY_HOLD_MS = 80
 KEY_HOLD_S = KEY_HOLD_MS / 1000.0
 MOUSE_HOLD_MS = 30
 MOUSE_HOLD_S = MOUSE_HOLD_MS / 1000.0
+BUFF_MOUSE_CAPTURE_SETTLE_MS = 150
+BUFF_MOUSE_CAPTURE_SETTLE_S = BUFF_MOUSE_CAPTURE_SETTLE_MS / 1000.0
 DEFAULT_ATTACK_INTERVAL_S = 0.3
 DEFAULT_BUFF_INTERVAL_S = 1200
 DEFAULT_BUFF_KEY_INTERVAL_S = 3.0
@@ -926,26 +938,62 @@ class App:
                 buff_interval or DEFAULT_BUFF_INTERVAL_S,
             )
             if combo_due:
-                # 整个组合执行期间不发送攻击键。使用本次组合快照，
-                # 确保按 F1~F12、1~0 的固定顺序完整执行。
+                # 整个组合期间按住右键，让游戏保持在视角输入状态。
+                # 使用本次组合快照，确保按固定顺序完整执行。
                 attack_deadline = None
-                for index, (scan_code, extended) in enumerate(buff_snapshot):
-                    if not self.running or self.stop_event.is_set():
-                        break
+                right_button_held = False
+                try:
                     if not self._ensure_game_focus():
-                        break
-                    success = send_key_press(
-                        scan_code,
-                        extended,
-                        self.hold_s,
-                        self.stop_event,
+                        continue
+                    right_button_held = send_mouse_event(
+                        MOUSEEVENTF_RIGHTDOWN
                     )
-                    if not success:
-                        self.send_error = (
-                            "发送 Buff 失败，请尝试以管理员身份运行"
+                    if not right_button_held:
+                        self._mark_focus_lost(
+                            "无法按住鼠标右键，辅助已停止；请尝试以管理员身份运行"
                         )
-                    if self.running and index < len(buff_snapshot) - 1:
+                        continue
+
+                    # 右移再移回，光标位置不变，但可触发游戏的视角捕获。
+                    moved = send_mouse_move(1, 0)
+                    moved_back = send_mouse_move(-1, 0)
+                    if not moved or not moved_back:
+                        self.send_error = "触发游戏视角输入失败"
+                    self._wait_buff_key_interval(
+                        BUFF_MOUSE_CAPTURE_SETTLE_S
+                    )
+
+                    for scan_code, extended in buff_snapshot:
+                        if not self.running or self.stop_event.is_set():
+                            break
+                        if not self._ensure_game_focus():
+                            break
+                        success = send_key_press(
+                            scan_code,
+                            extended,
+                            self.hold_s,
+                            self.stop_event,
+                        )
+                        if not success:
+                            self.send_error = (
+                                "发送 Buff 失败，请尝试以管理员身份运行"
+                            )
+                        if not self.running or self.stop_event.is_set():
+                            break
+                        if not self._ensure_game_focus():
+                            break
+
+                        # 包括最后一个 Buff，给技能留下完整的生效时间。
                         self._wait_buff_key_interval(buff_key_interval)
+                finally:
+                    if right_button_held:
+                        released = send_mouse_event(MOUSEEVENTF_RIGHTUP)
+                        if not released:
+                            released = send_mouse_event(MOUSEEVENTF_RIGHTUP)
+                        if not released:
+                            self._mark_focus_lost(
+                                "无法松开鼠标右键，请手动右击一次"
+                            )
                 if self.running:
                     scheduler.complete(time.monotonic())
                 continue

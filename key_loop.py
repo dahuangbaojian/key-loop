@@ -166,6 +166,7 @@ class App:
 
         self.running = False
         self.closed = False
+        self.start_job = None
         self.snapshot = ()
         self.hold_s = KEY_HOLD_S
         self.invalid_rows = 0
@@ -186,17 +187,7 @@ class App:
         ttk.Label(
             top,
             text="开关键: %s    按住: %d 毫秒" % (TOGGLE_KEY, KEY_HOLD_MS),
-        ).pack(
-            side="left", padx=(0, 12)
-        )
-        self.top_var = tk.BooleanVar(value=bool(cfg.get("topmost", True)))
-        ttk.Checkbutton(
-            top,
-            text="窗口置顶",
-            variable=self.top_var,
-            command=self.apply_topmost,
         ).pack(side="left")
-        self.apply_topmost()
 
         ttk.Label(frm, text="启用").grid(row=1, column=0, padx=4)
         ttk.Label(frm, text="按键").grid(row=1, column=1, padx=4)
@@ -265,8 +256,8 @@ class App:
         ttk.Label(
             frm,
             text=(
-                "提示: Home 开关键全局有效，游戏内可直接开/关\n"
-                "开关键和按住时长已固定，无需配置"
+                "提示: Home 开关键全局有效，开始后自动最小化\n"
+                "再次按 Home 停止，并恢复本窗口"
             ),
             foreground="#888",
             justify="center",
@@ -326,7 +317,6 @@ class App:
                 }
             )
         data = {
-            "topmost": self.top_var.get(),
             "rows": rows,
         }
         temporary_file = CONFIG_FILE + ".tmp"
@@ -342,9 +332,6 @@ class App:
             return False
 
     # ---------- 界面动作 ----------
-    def apply_topmost(self):
-        self.root.attributes("-topmost", self.top_var.get())
-
     def set_all(self, value):
         for en_var, _, _ in self.row_vars:
             en_var.set(value)
@@ -353,13 +340,40 @@ class App:
     def toggle(self):
         if self.closed:
             return
-        self.running = not self.running
+
+        if self.start_job is not None:
+            self.root.after_cancel(self.start_job)
+            self.start_job = None
+            self._show_window()
+            self._update_status()
+            return
+
         if self.running:
+            self.running = False
+            self.wake_event.set()
+            self._show_window()
+        else:
             self.send_error = ""
             self._sync_runtime_config()
             self.save_config()
+            # 先最小化并给 Windows 足够时间恢复之前的前台窗口，
+            # 再开始发键，避免首个按键被 KeyLoop 自己接收。
+            self.root.iconify()
+            self.start_job = self.root.after(200, self._start_running)
+        self._update_status()
+
+    def _start_running(self):
+        self.start_job = None
+        if self.closed:
+            return
+        self.running = True
         self.wake_event.set()
         self._update_status()
+
+    def _show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.after(50, self.root.focus_force)
 
     def _sync_runtime_config(self):
         rows = []
@@ -424,6 +438,9 @@ class App:
             return
         self.closed = True
         self.running = False
+        if self.start_job is not None:
+            self.root.after_cancel(self.start_job)
+            self.start_job = None
         self.save_config()
         self.stop_event.set()
         self.wake_event.set()

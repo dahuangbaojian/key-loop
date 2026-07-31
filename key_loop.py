@@ -11,7 +11,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from key_loop_core import KeyBinding, KeyScheduler, perform_key_press
+from key_loop_core import BuffComboScheduler, perform_key_press
 
 
 if os.name != "nt":
@@ -21,10 +21,13 @@ if os.name != "nt":
 # ---------------- Win32 SendInput 底层实现 ----------------
 user32 = ctypes.windll.user32
 
+INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 
 
 class KeyBdInput(ctypes.Structure):
@@ -108,21 +111,42 @@ def send_key_press(scan_code, extended, hold_s, shutdown_event):
     )
 
 
+def send_mouse_event(flags):
+    """发送一个鼠标事件，成功时返回 True。"""
+
+    union = InputUnion()
+    union.mi = MouseInput(0, 0, 0, flags, 0, 0)
+    event = Input(INPUT_MOUSE, union)
+    return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
+
+
+def send_right_click(hold_s, shutdown_event):
+    """发送一次完整右键点击。"""
+
+    pressed = send_mouse_event(MOUSEEVENTF_RIGHTDOWN)
+    if pressed:
+        shutdown_event.wait(hold_s)
+    released = send_mouse_event(MOUSEEVENTF_RIGHTUP)
+    return pressed and released
+
+
 # ---------------- 按键与配置 ----------------
-KEYS = {}
+BUFF_KEYS = {}
 for _i in range(10):
-    KEYS["F%d" % (_i + 1)] = (0x3B + _i, False)
-KEYS["F11"] = (0x57, False)
-KEYS["F12"] = (0x58, False)
+    BUFF_KEYS["F%d" % (_i + 1)] = (0x3B + _i, False)
+BUFF_KEYS["F11"] = (0x57, False)
+BUFF_KEYS["F12"] = (0x58, False)
 for _i, _c in enumerate("1234567890"):
-    KEYS[_c] = (0x02 + _i, False)
+    BUFF_KEYS[_c] = (0x02 + _i, False)
+
+KEYBOARD_KEYS = dict(BUFF_KEYS)
 for _i, _c in enumerate("QWERTYUIOP"):
-    KEYS[_c] = (0x10 + _i, False)
+    KEYBOARD_KEYS[_c] = (0x10 + _i, False)
 for _i, _c in enumerate("ASDFGHJKL"):
-    KEYS[_c] = (0x1E + _i, False)
+    KEYBOARD_KEYS[_c] = (0x1E + _i, False)
 for _i, _c in enumerate("ZXCVBNM"):
-    KEYS[_c] = (0x2C + _i, False)
-KEYS.update(
+    KEYBOARD_KEYS[_c] = (0x2C + _i, False)
+KEYBOARD_KEYS.update(
     {
         "空格": (0x39, False),
         "Tab": (0x0F, False),
@@ -139,11 +163,19 @@ KEYS.update(
     }
 )
 
-NUM_ROWS = 12
+FUNCTION_BUFF_KEYS = tuple("F%d" % i for i in range(1, 13))
+NUMBER_BUFF_KEYS = tuple("1234567890")
+MOUSE_RIGHT = "鼠标右键"
+ATTACK_OPTIONS = (MOUSE_RIGHT,) + tuple(KEYBOARD_KEYS)
 TOGGLE_KEY = "Home"
 TOGGLE_VK = 0x24
 KEY_HOLD_MS = 80
 KEY_HOLD_S = KEY_HOLD_MS / 1000.0
+MOUSE_HOLD_MS = 30
+MOUSE_HOLD_S = MOUSE_HOLD_MS / 1000.0
+ATTACK_INTERVAL_S = 0.3
+BUFF_GAP_S = 1.5
+DEFAULT_BUFF_INTERVAL_S = 1200
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_CONFIG_FILE = os.path.join(PROGRAM_DIR, "key_loop_config.json")
@@ -167,9 +199,13 @@ class App:
         self.running = False
         self.closed = False
         self.start_job = None
-        self.snapshot = ()
+        self.runtime_config = (
+            ("mouse", 0, False),
+            (),
+            DEFAULT_BUFF_INTERVAL_S,
+        )
         self.hold_s = KEY_HOLD_S
-        self.invalid_rows = 0
+        self.invalid_buff_interval = False
         self.config_error = ""
         self.send_error = ""
 
@@ -183,52 +219,97 @@ class App:
         frm.grid()
 
         top = ttk.Frame(frm)
-        top.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        top.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(
             top,
-            text="开关键: %s    按住: %d 毫秒" % (TOGGLE_KEY, KEY_HOLD_MS),
+            text=(
+                "开关键: %s    攻击: %.1f 秒/次    Buff 吟唱间隔: %.1f 秒"
+                % (TOGGLE_KEY, ATTACK_INTERVAL_S, BUFF_GAP_S)
+            ),
         ).pack(side="left")
 
-        ttk.Label(frm, text="启用").grid(row=1, column=0, padx=4)
-        ttk.Label(frm, text="按键").grid(row=1, column=1, padx=4)
-        ttk.Label(frm, text="间隔(秒)").grid(row=1, column=2, padx=4)
+        rows_cfg = cfg.get("rows") if isinstance(cfg.get("rows"), list) else []
+        legacy_enabled_keys = {
+            row.get("key")
+            for row in rows_cfg
+            if (
+                isinstance(row, dict)
+                and row.get("key") in BUFF_KEYS
+                and bool(row.get("enabled", False))
+            )
+        }
+        configured_keys = cfg.get("buff_keys")
+        if isinstance(configured_keys, list):
+            enabled_keys = {
+                key for key in configured_keys if key in BUFF_KEYS
+            }
+        else:
+            enabled_keys = legacy_enabled_keys
+
+        configured_interval = cfg.get(
+            "buff_interval", DEFAULT_BUFF_INTERVAL_S
+        )
+
+        attack = cfg.get("attack_key", MOUSE_RIGHT)
+        if attack not in ATTACK_OPTIONS:
+            attack = MOUSE_RIGHT
+        attack_frame = ttk.LabelFrame(frm, text="攻击键", padding=8)
+        attack_frame.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+        self.attack_var = tk.StringVar(value=attack)
+        ttk.Label(attack_frame, text="按键:").pack(side="left")
+        ttk.Combobox(
+            attack_frame,
+            textvariable=self.attack_var,
+            width=10,
+            values=ATTACK_OPTIONS,
+            state="readonly",
+        ).pack(side="left", padx=(6, 14))
+        ttk.Label(
+            attack_frame,
+            text="固定每 %.1f 秒触发一次" % ATTACK_INTERVAL_S,
+        ).pack(side="left")
+
+        combo_frame = ttk.LabelFrame(frm, text="Buff 组合", padding=8)
+        combo_frame.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+        self.buff_interval_var = tk.StringVar(value=str(configured_interval))
+        ttk.Label(combo_frame, text="组合循环间隔(秒):").pack(side="left")
+        ttk.Entry(
+            combo_frame, textvariable=self.buff_interval_var, width=10
+        ).pack(side="left", padx=(6, 14))
+        ttk.Label(
+            combo_frame,
+            text="组合内按键依次触发，每个键留 %.1f 秒吟唱时间"
+            % BUFF_GAP_S,
+        ).pack(side="left")
 
         self.row_vars = []
-        rows_cfg = cfg.get("rows") if isinstance(cfg.get("rows"), list) else []
-        for i in range(NUM_ROWS):
-            rc = (
-                rows_cfg[i]
-                if i < len(rows_cfg) and isinstance(rows_cfg[i], dict)
-                else {}
-            )
-            en_var = tk.BooleanVar(value=bool(rc.get("enabled", i == 0)))
-            key_var = tk.StringVar(
-                value=(
-                    rc.get("key")
-                    if rc.get("key") in KEYS
-                    else "F%d" % (i + 1)
-                )
-            )
-            int_var = tk.StringVar(value=str(rc.get("interval", "1.0")))
 
-            ttk.Checkbutton(frm, variable=en_var).grid(row=i + 2, column=0)
-            ttk.Combobox(
-                frm,
-                textvariable=key_var,
-                width=6,
-                values=list(KEYS),
-                state="readonly",
-            ).grid(row=i + 2, column=1, padx=4, pady=2)
-            ttk.Entry(frm, textvariable=int_var, width=8).grid(
-                row=i + 2, column=2, padx=4
-            )
-            self.row_vars.append((en_var, key_var, int_var))
+        groups = ttk.Frame(frm)
+        groups.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        self._build_buff_group(
+            groups,
+            0,
+            "F 键 Buff",
+            FUNCTION_BUFF_KEYS,
+            enabled_keys,
+        )
+        self._build_buff_group(
+            groups,
+            1,
+            "数字键 Buff",
+            NUMBER_BUFF_KEYS,
+            enabled_keys,
+        )
 
         bulk = ttk.Frame(frm)
         bulk.grid(
-            row=NUM_ROWS + 2,
+            row=4,
             column=0,
-            columnspan=3,
+            columnspan=2,
             pady=(8, 0),
             sticky="ew",
         )
@@ -243,28 +324,28 @@ class App:
             frm, text="开始 (%s)" % TOGGLE_KEY, command=self.toggle
         )
         self.btn.grid(
-            row=NUM_ROWS + 3,
+            row=5,
             column=0,
-            columnspan=3,
+            columnspan=2,
             pady=(6, 4),
             sticky="ew",
         )
 
         self.status = ttk.Label(frm, text="已停止", foreground="gray")
-        self.status.grid(row=NUM_ROWS + 4, column=0, columnspan=3)
+        self.status.grid(row=6, column=0, columnspan=2)
 
         ttk.Label(
             frm,
             text=(
-                "提示: Home 开关键全局有效，开始后自动最小化\n"
-                "再次按 Home 停止，并恢复本窗口"
+                "提示: Home 开关键全局有效，开始后自动隐藏窗口\n"
+                "Buff 组合执行时自动暂停攻击，组合结束后自动恢复"
             ),
             foreground="#888",
             justify="center",
         ).grid(
-            row=NUM_ROWS + 5,
+            row=7,
             column=0,
-            columnspan=3,
+            columnspan=2,
             pady=(6, 0),
         )
 
@@ -280,6 +361,23 @@ class App:
         self.worker_thread.start()
         self.hotkey_thread.start()
         self.root.after(50, self._refresh_ui)
+
+    def _build_buff_group(self, parent, column, title, keys, enabled_keys):
+        group = ttk.LabelFrame(parent, text=title, padding=8)
+        group.grid(row=0, column=column, padx=4, sticky="n")
+        ttk.Label(group, text="启用").grid(row=0, column=0, padx=4)
+        ttk.Label(group, text="按键").grid(row=0, column=1, padx=8)
+
+        for row, key_name in enumerate(keys, start=1):
+            enabled_var = tk.BooleanVar(value=key_name in enabled_keys)
+
+            ttk.Checkbutton(group, variable=enabled_var).grid(
+                row=row, column=0
+            )
+            ttk.Label(group, text=key_name, width=4, anchor="center").grid(
+                row=row, column=1, padx=8, pady=2
+            )
+            self.row_vars.append((key_name, enabled_var))
 
     # ---------- 配置 ----------
     def load_config(self):
@@ -303,21 +401,19 @@ class App:
         return {}
 
     def save_config(self):
-        rows = []
-        for en_var, key_var, int_var in self.row_vars:
-            try:
-                interval = float(int_var.get())
-            except ValueError:
-                interval = int_var.get()
-            rows.append(
-                {
-                    "enabled": en_var.get(),
-                    "key": key_var.get(),
-                    "interval": interval,
-                }
-            )
+        try:
+            buff_interval = float(self.buff_interval_var.get())
+        except ValueError:
+            buff_interval = self.buff_interval_var.get()
         data = {
-            "rows": rows,
+            "version": 2,
+            "attack_key": self.attack_var.get(),
+            "buff_interval": buff_interval,
+            "buff_keys": [
+                key_name
+                for key_name, enabled_var in self.row_vars
+                if enabled_var.get()
+            ],
         }
         temporary_file = CONFIG_FILE + ".tmp"
         try:
@@ -333,8 +429,8 @@ class App:
 
     # ---------- 界面动作 ----------
     def set_all(self, value):
-        for en_var, _, _ in self.row_vars:
-            en_var.set(value)
+        for _, enabled_var in self.row_vars:
+            enabled_var.set(value)
         self._sync_runtime_config()
 
     def toggle(self):
@@ -356,9 +452,9 @@ class App:
             self.send_error = ""
             self._sync_runtime_config()
             self.save_config()
-            # 先最小化并给 Windows 足够时间恢复之前的前台窗口，
-            # 再开始发键，避免首个按键被 KeyLoop 自己接收。
-            self.root.iconify()
+            # 隐藏而不是最小化：最小化会激活 Windows 任务栏，导致
+            # 全屏游戏底部残留任务栏。隐藏后再给游戏恢复焦点的时间。
+            self.root.withdraw()
             self.start_job = self.root.after(200, self._start_running)
         self._update_status()
 
@@ -375,31 +471,52 @@ class App:
         self.root.lift()
         self.root.after(50, self.root.focus_force)
 
+    def _wait_buff_gap(self):
+        """等待固定 Buff 间隔，同时允许 Home 停止立即打断。"""
+
+        deadline = time.monotonic() + BUFF_GAP_S
+        while self.running and not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.wake_event.wait(remaining)
+            self.wake_event.clear()
+
     def _sync_runtime_config(self):
-        rows = []
-        invalid_rows = 0
+        attack_name = self.attack_var.get()
+        if attack_name == MOUSE_RIGHT:
+            new_attack_action = ("mouse", 0, False)
+        else:
+            info = KEYBOARD_KEYS.get(attack_name)
+            new_attack_action = (
+                ("keyboard", info[0], info[1])
+                if info
+                else ("mouse", 0, False)
+            )
 
-        for i, (en_var, key_var, int_var) in enumerate(self.row_vars):
-            if not en_var.get():
-                continue
-            name = key_var.get()
-            info = KEYS.get(name)
-            try:
-                interval = float(int_var.get())
-            except ValueError:
-                invalid_rows += 1
-                continue
-            if not info or interval <= 0:
-                invalid_rows += 1
-                continue
-            rows.append(KeyBinding(i, info[0], info[1], interval))
+        new_buff_snapshot = tuple(
+            BUFF_KEYS[key_name]
+            for key_name, enabled_var in self.row_vars
+            if enabled_var.get()
+        )
+        try:
+            new_buff_interval = float(self.buff_interval_var.get())
+            if new_buff_interval <= 0:
+                raise ValueError
+            invalid_buff_interval = False
+        except ValueError:
+            new_buff_interval = None
+            invalid_buff_interval = True
 
-        new_snapshot = tuple(rows)
-
-        if new_snapshot != self.snapshot:
-            self.snapshot = new_snapshot
+        new_state = (
+            new_attack_action,
+            new_buff_snapshot,
+            new_buff_interval,
+        )
+        if new_state != self.runtime_config:
+            self.runtime_config = new_state
             self.wake_event.set()
-        self.invalid_rows = invalid_rows
+        self.invalid_buff_interval = invalid_buff_interval
 
     def _refresh_ui(self):
         if self.closed:
@@ -421,13 +538,15 @@ class App:
         elif self.send_error:
             self.status.config(text=self.send_error, foreground="red")
         elif self.running:
+            _, buff_snapshot, _ = self.runtime_config
             suffix = (
-                "，忽略 %d 项无效配置" % self.invalid_rows
-                if self.invalid_rows
+                "，Buff 间隔无效，组合已暂停"
+                if self.invalid_buff_interval
                 else ""
             )
             self.status.config(
-                text="运行中... 共 %d 个按键%s" % (len(self.snapshot), suffix),
+                text="运行中... 攻击键 %s，Buff 组合 %d 个按键%s"
+                % (self.attack_var.get(), len(buff_snapshot), suffix),
                 foreground="green",
             )
         else:
@@ -463,25 +582,75 @@ class App:
             self.stop_event.wait(0.05)
 
     def worker(self):
-        """按稳定串行队列发送完整的按下/松开事件。"""
+        """Buff 组合优先执行；组合外按固定频率发送攻击键。"""
 
-        scheduler = KeyScheduler()
+        scheduler = BuffComboScheduler()
+        attack_deadline = None
         while not self.stop_event.is_set():
-            binding = scheduler.next_press(
-                time.monotonic(), self.running, self.snapshot
+            if not self.running:
+                attack_deadline = None
+
+            now = time.monotonic()
+            attack_action, buff_snapshot, buff_interval = self.runtime_config
+            combo_enabled = bool(buff_snapshot) and buff_interval is not None
+            combo_due = scheduler.should_start(
+                now,
+                self.running,
+                combo_enabled,
+                buff_interval or DEFAULT_BUFF_INTERVAL_S,
             )
-            if binding is not None:
-                success = send_key_press(
-                    binding.scan_code,
-                    binding.extended,
-                    self.hold_s,
-                    self.stop_event,
-                )
-                if not success:
-                    self.send_error = "发键失败，请尝试以管理员身份运行"
+            if combo_due:
+                # 整个组合执行期间不发送攻击键。使用本次组合快照，
+                # 确保按 F1~F12、1~0 的固定顺序完整执行。
+                attack_deadline = None
+                for scan_code, extended in buff_snapshot:
+                    if not self.running or self.stop_event.is_set():
+                        break
+                    success = send_key_press(
+                        scan_code,
+                        extended,
+                        self.hold_s,
+                        self.stop_event,
+                    )
+                    if not success:
+                        self.send_error = (
+                            "发送 Buff 失败，请尝试以管理员身份运行"
+                        )
+                    if self.running:
+                        self._wait_buff_gap()
+                if self.running:
+                    scheduler.complete(time.monotonic())
                 continue
 
-            delay = scheduler.next_delay(time.monotonic())
+            now = time.monotonic()
+            if self.running:
+                if attack_deadline is None:
+                    attack_deadline = now
+                if now >= attack_deadline:
+                    action_type, scan_code, extended = attack_action
+                    if action_type == "mouse":
+                        success = send_right_click(
+                            MOUSE_HOLD_S, self.stop_event
+                        )
+                    else:
+                        success = send_key_press(
+                            scan_code,
+                            extended,
+                            self.hold_s,
+                            self.stop_event,
+                        )
+                    if not success:
+                        self.send_error = (
+                            "发送攻击键失败，请尝试以管理员身份运行"
+                        )
+                    attack_deadline = now + ATTACK_INTERVAL_S
+                    continue
+                delay = min(
+                    scheduler.next_delay(now),
+                    max(0.0, attack_deadline - now),
+                )
+            else:
+                delay = scheduler.next_delay(now)
             self.wake_event.wait(delay)
             self.wake_event.clear()
 

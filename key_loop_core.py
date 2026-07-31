@@ -1,21 +1,6 @@
-"""Platform-independent stable scheduling primitives for KeyLoop."""
+"""Platform-independent scheduling primitives for KeyLoop."""
 
-from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Optional, Tuple
-
-
-@dataclass(frozen=True)
-class KeyBinding:
-    """One configured key slot."""
-
-    row_id: int
-    scan_code: int
-    extended: bool
-    interval: float
-
-    @property
-    def key(self) -> Tuple[int, bool]:
-        return self.scan_code, self.extended
+from typing import Callable
 
 
 def perform_key_press(
@@ -34,68 +19,60 @@ def perform_key_press(
     return pressed and released
 
 
-class KeyScheduler:
-    """Choose one due key at a time for stable, serialized key presses."""
+class BuffComboScheduler:
+    """Schedule one complete Buff combo at a time."""
 
     def __init__(self) -> None:
         self._running = False
-        self._bindings: Dict[int, KeyBinding] = {}
-        self._deadlines: Dict[int, float] = {}
+        self._enabled = False
+        self._interval = 0.0
+        self._deadline = None
 
-    def next_press(
+    def should_start(
         self,
         now: float,
         running: bool,
-        bindings: Iterable[KeyBinding],
-    ) -> Optional[KeyBinding]:
-        """Return the next due slot, or ``None`` when nothing is due."""
-
-        current = {binding.row_id: binding for binding in bindings}
+        enabled: bool,
+        interval: float,
+    ) -> bool:
+        """Return True once when the enabled combo becomes due."""
 
         if not running:
             self._running = False
-            self._bindings = {}
-            self._deadlines = {}
-            return None
+            self._enabled = False
+            self._deadline = None
+            return False
 
         if not self._running:
-            # Starting always triggers every enabled slot as soon as the
-            # stable serial queue can process it.
-            self._deadlines = {row_id: now for row_id in current}
+            # Each run starts with one immediate Buff combo.
+            self._deadline = now if enabled else None
         else:
-            for row_id in set(self._bindings) - set(current):
-                self._deadlines.pop(row_id, None)
-            for row_id, binding in current.items():
-                previous = self._bindings.get(row_id)
-                if previous is None or previous.key != binding.key:
-                    self._deadlines[row_id] = now
-                elif previous.interval != binding.interval:
-                    self._deadlines[row_id] = now + binding.interval
+            if not enabled:
+                self._deadline = None
+            elif not self._enabled:
+                self._deadline = now
+            elif interval != self._interval:
+                self._deadline = now + interval
 
         self._running = True
-        self._bindings = current
+        self._enabled = enabled
+        self._interval = interval
 
-        due = [
-            binding
-            for row_id, binding in current.items()
-            if now >= self._deadlines.get(row_id, now)
-        ]
-        if not due:
-            return None
+        if enabled and self._deadline is not None and now >= self._deadline:
+            # No new combo is scheduled until the current one reports complete.
+            self._deadline = None
+            return True
+        return False
 
-        # Oldest deadline first; row_id makes simultaneous slots deterministic.
-        binding = min(
-            due,
-            key=lambda item: (self._deadlines[item.row_id], item.row_id),
-        )
-        # Base the next interval on the actual dispatch time. Missed periods are
-        # skipped instead of being queued into a burst.
-        self._deadlines[binding.row_id] = now + binding.interval
-        return binding
+    def complete(self, now: float) -> None:
+        """Start the configured interval after the whole combo finishes."""
+
+        if self._running and self._enabled:
+            self._deadline = now + self._interval
 
     def next_delay(self, now: float, maximum: float = 0.05) -> float:
-        """Return a bounded wait until the next scheduled press."""
+        """Return a bounded wait until the next combo."""
 
-        if not self._running or not self._deadlines:
+        if not self._running or self._deadline is None:
             return maximum
-        return max(0.0, min(maximum, min(self._deadlines.values()) - now))
+        return max(0.0, min(maximum, self._deadline - now))

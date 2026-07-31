@@ -1,94 +1,65 @@
 import unittest
 
-from key_loop_core import KeyBinding, KeyScheduler, perform_key_press
+from key_loop_core import BuffComboScheduler, perform_key_press
 
 
-class KeySchedulerTests(unittest.TestCase):
+class BuffComboSchedulerTests(unittest.TestCase):
     def setUp(self):
-        self.scheduler = KeyScheduler()
+        self.scheduler = BuffComboScheduler()
 
-    def test_simultaneous_slots_are_dispatched_serially(self):
-        bindings = (
-            KeyBinding(0, 0x3B, False, 1.0),
-            KeyBinding(1, 0x3C, False, 2.0),
-        )
+    def test_start_runs_enabled_combo_immediately(self):
+        self.assertTrue(self.scheduler.should_start(0.0, True, True, 1200.0))
+        self.assertFalse(self.scheduler.should_start(0.1, True, True, 1200.0))
 
-        self.assertEqual(
-            self.scheduler.next_press(0.0, True, bindings), bindings[0]
+    def test_interval_starts_after_combo_completes(self):
+        self.scheduler.should_start(0.0, True, True, 1200.0)
+        self.scheduler.complete(30.0)
+
+        self.assertFalse(
+            self.scheduler.should_start(1229.9, True, True, 1200.0)
         )
-        self.assertEqual(
-            self.scheduler.next_press(0.03, True, bindings), bindings[1]
-        )
-        self.assertIsNone(
-            self.scheduler.next_press(0.99, True, bindings)
-        )
-        self.assertEqual(
-            self.scheduler.next_press(1.0, True, bindings), bindings[0]
+        self.assertTrue(
+            self.scheduler.should_start(1230.0, True, True, 1200.0)
         )
 
-    def test_restart_triggers_enabled_slot_immediately(self):
-        bindings = (KeyBinding(0, 0x3B, False, 1.0),)
-        self.scheduler.next_press(0.0, True, bindings)
-
-        self.assertIsNone(self.scheduler.next_press(0.1, False, bindings))
-        self.assertEqual(
-            self.scheduler.next_press(0.2, True, bindings), bindings[0]
+    def test_enabling_first_buff_runs_combo_immediately(self):
+        self.assertFalse(
+            self.scheduler.should_start(0.0, True, False, 1200.0)
         )
-
-    def test_key_edit_takes_effect_immediately(self):
-        original = (KeyBinding(0, 0x3B, False, 1.0),)
-        updated = (KeyBinding(0, 0x3C, False, 1.0),)
-        self.scheduler.next_press(0.0, True, original)
-
-        self.assertEqual(
-            self.scheduler.next_press(0.1, True, updated), updated[0]
-        )
-
-    def test_duplicate_keys_are_separate_taps(self):
-        bindings = (
-            KeyBinding(0, 0x3B, False, 1.0),
-            KeyBinding(1, 0x3B, False, 2.0),
-        )
-
-        self.assertEqual(
-            self.scheduler.next_press(0.0, True, bindings), bindings[0]
-        )
-        self.assertEqual(
-            self.scheduler.next_press(0.03, True, bindings), bindings[1]
+        self.assertTrue(
+            self.scheduler.should_start(1.0, True, True, 1200.0)
         )
 
     def test_interval_edit_starts_a_fresh_interval(self):
-        original = (KeyBinding(0, 0x3B, False, 1.0),)
-        updated = (KeyBinding(0, 0x3B, False, 10.0),)
-        self.scheduler.next_press(0.0, True, original)
+        self.scheduler.should_start(0.0, True, True, 1200.0)
+        self.scheduler.complete(30.0)
 
-        self.assertIsNone(
-            self.scheduler.next_press(0.5, True, updated)
+        self.assertFalse(
+            self.scheduler.should_start(100.0, True, True, 600.0)
         )
-        self.assertIsNone(
-            self.scheduler.next_press(10.49, True, updated)
+        self.assertFalse(
+            self.scheduler.should_start(699.9, True, True, 600.0)
         )
-        self.assertEqual(
-            self.scheduler.next_press(10.5, True, updated), updated[0]
+        self.assertTrue(
+            self.scheduler.should_start(700.0, True, True, 600.0)
+        )
+
+    def test_restart_runs_combo_immediately(self):
+        self.scheduler.should_start(0.0, True, True, 1200.0)
+
+        self.assertFalse(
+            self.scheduler.should_start(0.1, False, True, 1200.0)
+        )
+        self.assertTrue(
+            self.scheduler.should_start(0.2, True, True, 1200.0)
         )
 
     def test_wait_is_bounded_by_next_deadline(self):
-        bindings = (KeyBinding(0, 0x3B, False, 1.0),)
-        self.scheduler.next_press(0.0, True, bindings)
+        self.scheduler.should_start(0.0, True, True, 1.0)
+        self.scheduler.complete(0.0)
 
         self.assertAlmostEqual(self.scheduler.next_delay(0.0), 0.05)
         self.assertAlmostEqual(self.scheduler.next_delay(0.98), 0.02)
-
-    def test_missed_intervals_do_not_create_a_burst(self):
-        bindings = (KeyBinding(0, 0x3B, False, 0.01),)
-        self.scheduler.next_press(0.0, True, bindings)
-
-        self.assertEqual(
-            self.scheduler.next_press(1.0, True, bindings), bindings[0]
-        )
-        self.assertIsNone(
-            self.scheduler.next_press(1.005, True, bindings)
-        )
 
 
 class KeyPressTests(unittest.TestCase):

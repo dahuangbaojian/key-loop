@@ -132,7 +132,6 @@ KEYS.update(
         "Shift": (0x2A, False),
         "Ctrl": (0x1D, False),
         "Alt": (0x38, False),
-        "Home": (0x47, True),
         "↑": (0x48, True),
         "↓": (0x50, True),
         "←": (0x4B, True),
@@ -140,10 +139,11 @@ KEYS.update(
     }
 )
 
-HOTKEY_VK = {"Home": 0x24}
-HOTKEY_VK.update({"F%d" % (i + 1): 0x70 + i for i in range(12)})
 NUM_ROWS = 12
-DEFAULT_HOTKEY = "Home"
+TOGGLE_KEY = "Home"
+TOGGLE_VK = 0x24
+KEY_HOLD_MS = 80
+KEY_HOLD_S = KEY_HOLD_MS / 1000.0
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_CONFIG_FILE = os.path.join(PROGRAM_DIR, "key_loop_config.json")
@@ -167,8 +167,7 @@ class App:
         self.running = False
         self.closed = False
         self.snapshot = ()
-        self.hotkey_vk = HOTKEY_VK[DEFAULT_HOTKEY]
-        self.hold_s = 0.03
+        self.hold_s = KEY_HOLD_S
         self.invalid_rows = 0
         self.config_error = ""
         self.send_error = ""
@@ -184,25 +183,11 @@ class App:
 
         top = ttk.Frame(frm)
         top.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        ttk.Label(top, text="开关热键").pack(side="left")
-        self.hotkey_var = tk.StringVar(
-            value=(
-                cfg.get("hotkey")
-                if cfg.get("hotkey") in HOTKEY_VK
-                else DEFAULT_HOTKEY
-            )
-        )
-        ttk.Combobox(
+        ttk.Label(
             top,
-            textvariable=self.hotkey_var,
-            width=4,
-            values=list(HOTKEY_VK),
-            state="readonly",
-        ).pack(side="left", padx=(4, 12))
-        ttk.Label(top, text="按住(毫秒)").pack(side="left")
-        self.hold_var = tk.StringVar(value=str(cfg.get("hold_ms", 30)))
-        ttk.Entry(top, textvariable=self.hold_var, width=5).pack(
-            side="left", padx=(4, 12)
+            text="开关键: %s    按住: %d 毫秒" % (TOGGLE_KEY, KEY_HOLD_MS),
+        ).pack(
+            side="left", padx=(0, 12)
         )
         self.top_var = tk.BooleanVar(value=bool(cfg.get("topmost", True)))
         ttk.Checkbutton(
@@ -264,7 +249,7 @@ class App:
         ).pack(side="left", expand=True, fill="x")
 
         self.btn = ttk.Button(
-            frm, text="开始 (%s)" % self.hotkey_var.get(), command=self.toggle
+            frm, text="开始 (%s)" % TOGGLE_KEY, command=self.toggle
         )
         self.btn.grid(
             row=NUM_ROWS + 3,
@@ -280,8 +265,8 @@ class App:
         ttk.Label(
             frm,
             text=(
-                "提示: 开关热键全局有效，游戏内可直接开/关\n"
-                "与开关热键相同的按键行不会被触发"
+                "提示: Home 开关键全局有效，游戏内可直接开/关\n"
+                "开关键和按住时长已固定，无需配置"
             ),
             foreground="#888",
             justify="center",
@@ -340,14 +325,7 @@ class App:
                     "interval": interval,
                 }
             )
-        try:
-            hold_ms = float(self.hold_var.get())
-        except ValueError:
-            hold_ms = 30
-
         data = {
-            "hotkey": self.hotkey_var.get(),
-            "hold_ms": hold_ms,
             "topmost": self.top_var.get(),
             "rows": rows,
         }
@@ -384,7 +362,6 @@ class App:
         self._update_status()
 
     def _sync_runtime_config(self):
-        hotkey_name = self.hotkey_var.get()
         rows = []
         invalid_rows = 0
 
@@ -392,9 +369,6 @@ class App:
             if not en_var.get():
                 continue
             name = key_var.get()
-            if name == hotkey_name:
-                invalid_rows += 1
-                continue
             info = KEYS.get(name)
             try:
                 interval = float(int_var.get())
@@ -406,26 +380,10 @@ class App:
                 continue
             rows.append(KeyBinding(i, info[0], info[1], interval))
 
-        try:
-            hold_ms = float(self.hold_var.get())
-        except ValueError:
-            hold_ms = 30.0
-            invalid_rows += 1
-
         new_snapshot = tuple(rows)
-        new_hotkey_vk = HOTKEY_VK.get(
-            hotkey_name, HOTKEY_VK[DEFAULT_HOTKEY]
-        )
-        new_hold_s = min(max(hold_ms, 10.0), 500.0) / 1000.0
 
-        if (
-            new_snapshot != self.snapshot
-            or new_hotkey_vk != self.hotkey_vk
-            or new_hold_s != self.hold_s
-        ):
+        if new_snapshot != self.snapshot:
             self.snapshot = new_snapshot
-            self.hotkey_vk = new_hotkey_vk
-            self.hold_s = new_hold_s
             self.wake_event.set()
         self.invalid_rows = invalid_rows
 
@@ -440,9 +398,8 @@ class App:
         self.root.after(50, self._refresh_ui)
 
     def _update_status(self):
-        hotkey_name = self.hotkey_var.get()
         self.btn.config(
-            text=("停止 (%s)" if self.running else "开始 (%s)") % hotkey_name
+            text=("停止 (%s)" if self.running else "开始 (%s)") % TOGGLE_KEY
         )
 
         if self.config_error:
@@ -479,13 +436,8 @@ class App:
         """轮询热键，只通过 Event 通知 Tk 主线程。"""
 
         pressed = False
-        current_vk = self.hotkey_vk
         while not self.stop_event.is_set():
-            if current_vk != self.hotkey_vk:
-                current_vk = self.hotkey_vk
-                pressed = False
-
-            state = user32.GetAsyncKeyState(current_vk) & 0x8000
+            state = user32.GetAsyncKeyState(TOGGLE_VK) & 0x8000
             if state and not pressed:
                 pressed = True
                 self.toggle_requested.set()

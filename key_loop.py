@@ -11,7 +11,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from key_loop_core import KeyBinding, KeyScheduler
+from key_loop_core import KeyBinding, KeyScheduler, perform_key_press
 
 
 if os.name != "nt":
@@ -92,6 +92,20 @@ def send_key_event(scan_code, extended=False, key_up=False):
     union.ki = KeyBdInput(0, scan_code, flags, 0, 0)
     event = Input(INPUT_KEYBOARD, union)
     return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
+
+
+def send_key_press(scan_code, extended, hold_s, shutdown_event):
+    """发送一次完整按键，并从实际按下时刻计算按住时间。"""
+
+    # 只允许程序退出提前结束等待；普通停止操作仍会完成本次按键，
+    # 保证目标程序看到足够长且成对的按下/松开事件。
+    return perform_key_press(
+        scan_code,
+        extended,
+        hold_s,
+        lambda code, ext, key_up: send_key_event(code, ext, key_up),
+        shutdown_event.wait,
+    )
 
 
 # ---------------- 按键与配置 ----------------
@@ -480,38 +494,27 @@ class App:
             self.stop_event.wait(0.05)
 
     def worker(self):
-        """计算独立按键时序，并及时发送按下与松开事件。"""
+        """按稳定串行队列发送完整的按下/松开事件。"""
 
         scheduler = KeyScheduler()
-        try:
-            while not self.stop_event.is_set():
-                now = time.monotonic()
-                actions = scheduler.tick(
-                    now, self.running, self.snapshot, self.hold_s
+        while not self.stop_event.is_set():
+            binding = scheduler.next_press(
+                time.monotonic(), self.running, self.snapshot
+            )
+            if binding is not None:
+                success = send_key_press(
+                    binding.scan_code,
+                    binding.extended,
+                    self.hold_s,
+                    self.stop_event,
                 )
-                for action in actions:
-                    success = send_key_event(
-                        action.scan_code,
-                        action.extended,
-                        key_up=not action.key_down,
-                    )
-                    if not success:
-                        self.send_error = (
-                            "发键失败，请尝试以管理员身份运行"
-                        )
+                if not success:
+                    self.send_error = "发键失败，请尝试以管理员身份运行"
+                continue
 
-                delay = scheduler.next_delay(time.monotonic())
-                self.wake_event.wait(delay)
-                self.wake_event.clear()
-        finally:
-            for action in scheduler.tick(
-                time.monotonic(), False, (), self.hold_s
-            ):
-                send_key_event(
-                    action.scan_code,
-                    action.extended,
-                    key_up=not action.key_down,
-                )
+            delay = scheduler.next_delay(time.monotonic())
+            self.wake_event.wait(delay)
+            self.wake_event.clear()
 
 
 def main():

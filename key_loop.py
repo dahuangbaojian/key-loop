@@ -197,12 +197,11 @@ KEY_HOLD_MS = 80
 KEY_HOLD_S = KEY_HOLD_MS / 1000.0
 MOUSE_HOLD_MS = 30
 MOUSE_HOLD_S = MOUSE_HOLD_MS / 1000.0
-ATTACK_INTERVAL_S = 0.3
-BUFF_GAP_S = 3.0
+DEFAULT_ATTACK_INTERVAL_S = 0.3
 DEFAULT_BUFF_INTERVAL_S = 1200
+DEFAULT_BUFF_KEY_INTERVAL_S = 3.0
 FOCUS_SETTLE_MS = 300
-FOCUS_RETRY_MS = 120
-FOCUS_MAX_ATTEMPTS = 8
+START_CAPTURE_MS = 5000
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_CONFIG_FILE = os.path.join(PROGRAM_DIR, "key_loop_config.json")
@@ -218,7 +217,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "key_loop_config.json")
 
 # ---------------- 界面 ----------------
 class App:
-    def __init__(self, root, initial_target=0):
+    def __init__(self, root):
         self.root = root
         root.title("KeyLoop 游戏辅助")
         root.resizable(False, False)
@@ -228,16 +227,16 @@ class App:
         self.closed = False
         self.start_job = None
         self.window_handle = 0
-        self.target_window = root_window_handle(initial_target)
-        self.focus_attempts = 0
-        self.focus_locked = False
+        self.target_window = 0
         self.runtime_config = (
             ("mouse", 0, False),
+            DEFAULT_ATTACK_INTERVAL_S,
             (),
             DEFAULT_BUFF_INTERVAL_S,
+            DEFAULT_BUFF_KEY_INTERVAL_S,
         )
         self.hold_s = KEY_HOLD_S
-        self.invalid_buff_interval = False
+        self.validation_error = ""
         self.config_error = ""
         self.send_error = ""
 
@@ -245,6 +244,7 @@ class App:
         self.wake_event = threading.Event()
         self.start_requested = threading.Event()
         self.stop_requested = threading.Event()
+        self.focus_lost_requested = threading.Event()
 
         cfg = self.load_config()
 
@@ -285,10 +285,17 @@ class App:
         configured_interval = cfg.get(
             "buff_interval", DEFAULT_BUFF_INTERVAL_S
         )
+        configured_key_interval = cfg.get(
+            "buff_key_interval", DEFAULT_BUFF_KEY_INTERVAL_S
+        )
+        configured_attack_interval = cfg.get(
+            "attack_interval", DEFAULT_ATTACK_INTERVAL_S
+        )
 
         attack = cfg.get("attack_key", MOUSE_RIGHT)
         if attack not in ATTACK_OPTIONS:
             attack = MOUSE_RIGHT
+
         attack_frame = ttk.LabelFrame(
             frm, text="攻击设置", padding=12, style="Section.TLabelframe"
         )
@@ -308,9 +315,15 @@ class App:
         ).pack(side="left", padx=(6, 14))
         ttk.Label(
             attack_frame,
-            text="每 %.1f 秒触发" % ATTACK_INTERVAL_S,
-            style="MutedCard.TLabel",
+            text="攻击间隔（秒）",
+            style="Card.TLabel",
         ).pack(side="left")
+        self.attack_interval_var = tk.StringVar(
+            value=str(configured_attack_interval)
+        )
+        ttk.Entry(
+            attack_frame, textvariable=self.attack_interval_var, width=8
+        ).pack(side="left", padx=(6, 0))
 
         combo_frame = ttk.LabelFrame(
             frm, text="Buff 设置", padding=12, style="Section.TLabelframe"
@@ -320,16 +333,22 @@ class App:
         )
         self.buff_interval_var = tk.StringVar(value=str(configured_interval))
         ttk.Label(
-            combo_frame, text="组合间隔（秒）", style="Card.TLabel"
+            combo_frame, text="整套间隔（秒）", style="Card.TLabel"
         ).pack(side="left")
         ttk.Entry(
             combo_frame, textvariable=self.buff_interval_var, width=10
-        ).pack(side="left", padx=(6, 14))
+        ).pack(side="left", padx=(6, 16))
         ttk.Label(
             combo_frame,
-            text="按顺序执行 · 每键预留 %.1f 秒" % BUFF_GAP_S,
-            style="MutedCard.TLabel",
+            text="按键间隔（秒）",
+            style="Card.TLabel",
         ).pack(side="left")
+        self.buff_key_interval_var = tk.StringVar(
+            value=str(configured_key_interval)
+        )
+        ttk.Entry(
+            combo_frame, textvariable=self.buff_key_interval_var, width=8
+        ).pack(side="left", padx=(6, 0))
 
         self.row_vars = []
 
@@ -405,7 +424,7 @@ class App:
 
         ttk.Label(
             frm,
-            text="%s 启动，%s 停止；切回游戏后先 Buff，再自动攻击。"
+            text="%s 启动后，请在 5 秒内切换到游戏；%s 停止。"
             % (START_KEY, STOP_KEY),
             style="Footer.TLabel",
             justify="center",
@@ -419,8 +438,6 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.update_idletasks()
         self.window_handle = root_window_handle(root.winfo_id())
-        if self.target_window == self.window_handle:
-            self.target_window = 0
 
         self._sync_runtime_config()
         self._update_status()
@@ -595,14 +612,20 @@ class App:
         return {}
 
     def save_config(self):
-        try:
-            buff_interval = float(self.buff_interval_var.get())
-        except ValueError:
-            buff_interval = self.buff_interval_var.get()
+        def number_or_text(variable):
+            try:
+                return float(variable.get())
+            except ValueError:
+                return variable.get()
+
         data = {
-            "version": 2,
+            "version": 3,
             "attack_key": self.attack_var.get(),
-            "buff_interval": buff_interval,
+            "attack_interval": number_or_text(self.attack_interval_var),
+            "buff_interval": number_or_text(self.buff_interval_var),
+            "buff_key_interval": number_or_text(
+                self.buff_key_interval_var
+            ),
             "buff_keys": [
                 key_name
                 for key_name, enabled_var in self.row_vars
@@ -631,21 +654,40 @@ class App:
         if self.closed or self.running or self.start_job is not None:
             return
 
-        self._remember_foreground_window()
         self.send_error = ""
-        if not self.target_window or not user32.IsWindow(self.target_window):
-            self.send_error = "未找到游戏窗口，请先点一下游戏再按 Home"
+        self._sync_runtime_config()
+        if self.validation_error:
+            self._update_status()
+            return
+        self.save_config()
+        # 隐藏而不是最小化：最小化会激活 Windows 任务栏，导致
+        # 全屏游戏底部残留任务栏。5 秒后才捕获前台游戏并启动。
+        self.root.withdraw()
+        self.start_job = self.root.after(
+            START_CAPTURE_MS, self._capture_game_and_start
+        )
+        self._update_status()
+
+    def _capture_game_and_start(self):
+        self.start_job = None
+        if self.closed:
+            return
+
+        foreground = root_window_handle(user32.GetForegroundWindow())
+        if (
+            not foreground
+            or foreground == self.window_handle
+            or not user32.IsWindow(foreground)
+        ):
+            self.running = False
+            self.send_error = "未捕获到游戏，请按 Home 后在 5 秒内切到游戏"
+            self._show_window()
             self._update_status()
             return
 
-        self._sync_runtime_config()
-        self.save_config()
-        # 隐藏而不是最小化：最小化会激活 Windows 任务栏，导致
-        # 全屏游戏底部残留任务栏。Buff 必须等游戏焦点确认后才启动。
-        self.focus_locked = True
-        self.root.withdraw()
-        self.focus_attempts = 0
-        self.start_job = self.root.after(50, self._focus_game_then_start)
+        self.target_window = foreground
+        self.running = True
+        self.wake_event.set()
         self._update_status()
 
     def stop(self):
@@ -657,75 +699,9 @@ class App:
         if self.start_job is not None:
             self.root.after_cancel(self.start_job)
             self.start_job = None
-        self.focus_attempts = 0
-        self.focus_locked = False
         self.running = False
         self.wake_event.set()
         self._show_window()
-        self._update_status()
-
-    def _remember_foreground_window(self):
-        foreground = root_window_handle(user32.GetForegroundWindow())
-        if (
-            foreground
-            and foreground != self.window_handle
-            and user32.IsWindow(foreground)
-        ):
-            self.target_window = foreground
-
-    def _focus_game_then_start(self):
-        self.start_job = None
-        if self.closed:
-            return
-
-        target = self.target_window
-        if not target or not user32.IsWindow(target):
-            self._abort_start("游戏窗口已关闭，请重新进入游戏后再按 Home")
-            return
-
-        if user32.IsIconic(target):
-            user32.ShowWindow(target, SW_RESTORE)
-        user32.SetForegroundWindow(target)
-        self.start_job = self.root.after(
-            FOCUS_SETTLE_MS, self._confirm_game_focus
-        )
-        self._update_status()
-
-    def _confirm_game_focus(self):
-        self.start_job = None
-        if self.closed:
-            return
-
-        foreground = root_window_handle(user32.GetForegroundWindow())
-        if foreground == self.target_window:
-            self._start_running()
-            return
-
-        self.focus_attempts += 1
-        if self.focus_attempts >= FOCUS_MAX_ATTEMPTS:
-            self._abort_start("无法切回游戏，请点一下游戏后再按 Home")
-            return
-
-        self.start_job = self.root.after(
-            FOCUS_RETRY_MS, self._focus_game_then_start
-        )
-        self._update_status()
-
-    def _abort_start(self, message):
-        self.start_job = None
-        self.running = False
-        self.focus_locked = False
-        self.send_error = message
-        self._show_window()
-        self._update_status()
-
-    def _start_running(self):
-        self.start_job = None
-        if self.closed:
-            return
-        self.focus_locked = False
-        self.running = True
-        self.wake_event.set()
         self._update_status()
 
     def _show_window(self):
@@ -733,10 +709,52 @@ class App:
         self.root.lift()
         self.root.after(50, self.root.focus_force)
 
-    def _wait_buff_gap(self):
-        """等待固定 Buff 间隔，同时允许 End 停止立即打断。"""
+    def _ensure_game_focus(self):
+        """每次发送输入前确认游戏焦点，必要时尝试恢复一次。"""
 
-        deadline = time.monotonic() + BUFF_GAP_S
+        if not self.running:
+            return False
+
+        target = self.target_window
+        if not target or not user32.IsWindow(target):
+            self._mark_focus_lost("游戏窗口已关闭，辅助已停止")
+            return False
+
+        if root_window_handle(user32.GetForegroundWindow()) == target:
+            return True
+
+        if user32.IsIconic(target):
+            user32.ShowWindow(target, SW_RESTORE)
+        user32.SetForegroundWindow(target)
+
+        deadline = time.monotonic() + FOCUS_SETTLE_MS / 1000.0
+        while self.running and not self.stop_event.is_set():
+            if root_window_handle(user32.GetForegroundWindow()) == target:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.wake_event.wait(min(remaining, 0.05))
+            self.wake_event.clear()
+
+        if self.running:
+            self._mark_focus_lost("游戏失去焦点，辅助已停止")
+        return False
+
+    def _mark_focus_lost(self, message):
+        self.send_error = message
+        self.running = False
+        self.wake_event.set()
+        self.focus_lost_requested.set()
+
+    def _show_focus_error(self):
+        self._show_window()
+        self._update_status()
+
+    def _wait_buff_key_interval(self, seconds):
+        """等待组合内按键间隔，同时允许 End 停止立即打断。"""
+
+        deadline = time.monotonic() + seconds
         while self.running and not self.stop_event.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -761,29 +779,50 @@ class App:
             for key_name, enabled_var in self.row_vars
             if enabled_var.get()
         )
-        try:
-            new_buff_interval = float(self.buff_interval_var.get())
-            if new_buff_interval <= 0:
-                raise ValueError
-            invalid_buff_interval = False
-        except ValueError:
-            new_buff_interval = None
-            invalid_buff_interval = True
+
+        validation_errors = []
+
+        def positive_interval(variable, label):
+            try:
+                value = float(variable.get())
+                if value <= 0:
+                    raise ValueError
+                return value
+            except ValueError:
+                validation_errors.append("%s必须大于 0" % label)
+                return None
+
+        new_attack_interval = positive_interval(
+            self.attack_interval_var, "攻击间隔"
+        )
+        new_buff_interval = positive_interval(
+            self.buff_interval_var, "整套 Buff 间隔"
+        )
+        new_buff_key_interval = positive_interval(
+            self.buff_key_interval_var, "Buff 按键间隔"
+        )
 
         new_state = (
             new_attack_action,
+            new_attack_interval,
             new_buff_snapshot,
             new_buff_interval,
+            new_buff_key_interval,
         )
         if new_state != self.runtime_config:
             self.runtime_config = new_state
             self.wake_event.set()
-        self.invalid_buff_interval = invalid_buff_interval
+        self.validation_error = "；".join(validation_errors)
 
     def _refresh_ui(self):
         if self.closed:
             return
-        if self.stop_requested.is_set():
+        if self.focus_lost_requested.is_set():
+            self.focus_lost_requested.clear()
+            self.start_requested.clear()
+            self.stop_requested.clear()
+            self._show_focus_error()
+        elif self.stop_requested.is_set():
             self.stop_requested.clear()
             self.start_requested.clear()
             self.stop()
@@ -803,20 +842,20 @@ class App:
             self.status.config(text=self.config_error, style="Error.TLabel")
         elif self.send_error:
             self.status.config(text=self.send_error, style="Error.TLabel")
+        elif self.validation_error:
+            self.status.config(
+                text=self.validation_error, style="Error.TLabel"
+            )
         elif self.start_job is not None:
             self.status.config(
-                text="● 正在切回游戏...", style="Running.TLabel"
+                text="● 请在 5 秒内切换到游戏...",
+                style="Running.TLabel",
             )
         elif self.running:
-            _, buff_snapshot, _ = self.runtime_config
-            suffix = (
-                "，Buff 间隔无效，组合已暂停"
-                if self.invalid_buff_interval
-                else ""
-            )
+            _, _, buff_snapshot, _, _ = self.runtime_config
             self.status.config(
-                text="● 运行中 · 攻击键 %s · Buff %d 个%s"
-                % (self.attack_var.get(), len(buff_snapshot), suffix),
+                text="● 运行中 · 攻击键 %s · Buff %d 个"
+                % (self.attack_var.get(), len(buff_snapshot)),
                 style="Running.TLabel",
             )
         else:
@@ -844,9 +883,6 @@ class App:
         start_pressed = False
         stop_pressed = False
         while not self.stop_event.is_set():
-            # 启动切焦期间锁定目标，避免把短暂出现的任务栏误记为游戏。
-            if not self.focus_locked:
-                self._remember_foreground_window()
             start_state = user32.GetAsyncKeyState(START_VK) & 0x8000
             stop_state = user32.GetAsyncKeyState(STOP_VK) & 0x8000
             if start_state and not start_pressed:
@@ -871,8 +907,18 @@ class App:
                 attack_deadline = None
 
             now = time.monotonic()
-            attack_action, buff_snapshot, buff_interval = self.runtime_config
-            combo_enabled = bool(buff_snapshot) and buff_interval is not None
+            (
+                attack_action,
+                attack_interval,
+                buff_snapshot,
+                buff_interval,
+                buff_key_interval,
+            ) = self.runtime_config
+            combo_enabled = (
+                bool(buff_snapshot)
+                and buff_interval is not None
+                and buff_key_interval is not None
+            )
             combo_due = scheduler.should_start(
                 now,
                 self.running,
@@ -883,8 +929,10 @@ class App:
                 # 整个组合执行期间不发送攻击键。使用本次组合快照，
                 # 确保按 F1~F12、1~0 的固定顺序完整执行。
                 attack_deadline = None
-                for scan_code, extended in buff_snapshot:
+                for index, (scan_code, extended) in enumerate(buff_snapshot):
                     if not self.running or self.stop_event.is_set():
+                        break
+                    if not self._ensure_game_focus():
                         break
                     success = send_key_press(
                         scan_code,
@@ -896,17 +944,19 @@ class App:
                         self.send_error = (
                             "发送 Buff 失败，请尝试以管理员身份运行"
                         )
-                    if self.running:
-                        self._wait_buff_gap()
+                    if self.running and index < len(buff_snapshot) - 1:
+                        self._wait_buff_key_interval(buff_key_interval)
                 if self.running:
                     scheduler.complete(time.monotonic())
                 continue
 
             now = time.monotonic()
-            if self.running:
+            if self.running and attack_interval is not None:
                 if attack_deadline is None:
                     attack_deadline = now
                 if now >= attack_deadline:
+                    if not self._ensure_game_focus():
+                        continue
                     action_type, scan_code, extended = attack_action
                     if action_type == "mouse":
                         success = send_right_click(
@@ -923,13 +973,14 @@ class App:
                         self.send_error = (
                             "发送攻击键失败，请尝试以管理员身份运行"
                         )
-                    attack_deadline = now + ATTACK_INTERVAL_S
+                    attack_deadline = now + attack_interval
                     continue
                 delay = min(
                     scheduler.next_delay(now),
                     max(0.0, attack_deadline - now),
                 )
             else:
+                attack_deadline = None
                 delay = scheduler.next_delay(now)
             self.wake_event.wait(delay)
             self.wake_event.clear()
@@ -940,9 +991,8 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
         pass
-    previous_foreground = root_window_handle(user32.GetForegroundWindow())
     root = tk.Tk()
-    App(root, previous_foreground)
+    App(root)
     root.mainloop()
 
 

@@ -28,6 +28,8 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
+GA_ROOT = 2
+SW_RESTORE = 9
 
 
 class KeyBdInput(ctypes.Structure):
@@ -80,6 +82,18 @@ user32.SendInput.argtypes = (
 user32.SendInput.restype = wintypes.UINT
 user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
 user32.GetAsyncKeyState.restype = wintypes.SHORT
+user32.GetForegroundWindow.argtypes = ()
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.GetAncestor.restype = wintypes.HWND
+user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.IsWindow.argtypes = (wintypes.HWND,)
+user32.IsWindow.restype = wintypes.BOOL
+user32.IsIconic.argtypes = (wintypes.HWND,)
+user32.IsIconic.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.ShowWindow.restype = wintypes.BOOL
 
 
 def send_key_event(scan_code, extended=False, key_up=False):
@@ -95,6 +109,14 @@ def send_key_event(scan_code, extended=False, key_up=False):
     union.ki = KeyBdInput(0, scan_code, flags, 0, 0)
     event = Input(INPUT_KEYBOARD, union)
     return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
+
+
+def root_window_handle(window_handle):
+    """将子窗口句柄规范化为所属顶层窗口句柄。"""
+
+    if not window_handle:
+        return 0
+    return user32.GetAncestor(window_handle, GA_ROOT) or window_handle
 
 
 def send_key_press(scan_code, extended, hold_s, shutdown_event):
@@ -176,8 +198,11 @@ KEY_HOLD_S = KEY_HOLD_MS / 1000.0
 MOUSE_HOLD_MS = 30
 MOUSE_HOLD_S = MOUSE_HOLD_MS / 1000.0
 ATTACK_INTERVAL_S = 0.3
-BUFF_GAP_S = 1.5
+BUFF_GAP_S = 3.0
 DEFAULT_BUFF_INTERVAL_S = 1200
+FOCUS_SETTLE_MS = 300
+FOCUS_RETRY_MS = 120
+FOCUS_MAX_ATTEMPTS = 8
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 LEGACY_CONFIG_FILE = os.path.join(PROGRAM_DIR, "key_loop_config.json")
@@ -193,7 +218,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "key_loop_config.json")
 
 # ---------------- 界面 ----------------
 class App:
-    def __init__(self, root):
+    def __init__(self, root, initial_target=0):
         self.root = root
         root.title("KeyLoop 游戏辅助")
         root.resizable(False, False)
@@ -202,6 +227,10 @@ class App:
         self.running = False
         self.closed = False
         self.start_job = None
+        self.window_handle = 0
+        self.target_window = root_window_handle(initial_target)
+        self.focus_attempts = 0
+        self.focus_locked = False
         self.runtime_config = (
             ("mouse", 0, False),
             (),
@@ -376,7 +405,7 @@ class App:
 
         ttk.Label(
             frm,
-            text="%s 启动，%s 停止；启动后先执行 Buff，再自动攻击。"
+            text="%s 启动，%s 停止；切回游戏后先 Buff，再自动攻击。"
             % (START_KEY, STOP_KEY),
             style="Footer.TLabel",
             justify="center",
@@ -388,6 +417,10 @@ class App:
         )
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.update_idletasks()
+        self.window_handle = root_window_handle(root.winfo_id())
+        if self.target_window == self.window_handle:
+            self.target_window = 0
 
         self._sync_runtime_config()
         self._update_status()
@@ -598,13 +631,21 @@ class App:
         if self.closed or self.running or self.start_job is not None:
             return
 
+        self._remember_foreground_window()
         self.send_error = ""
+        if not self.target_window or not user32.IsWindow(self.target_window):
+            self.send_error = "未找到游戏窗口，请先点一下游戏再按 Home"
+            self._update_status()
+            return
+
         self._sync_runtime_config()
         self.save_config()
         # 隐藏而不是最小化：最小化会激活 Windows 任务栏，导致
-        # 全屏游戏底部残留任务栏。隐藏后再给游戏恢复焦点的时间。
+        # 全屏游戏底部残留任务栏。Buff 必须等游戏焦点确认后才启动。
+        self.focus_locked = True
         self.root.withdraw()
-        self.start_job = self.root.after(200, self._start_running)
+        self.focus_attempts = 0
+        self.start_job = self.root.after(50, self._focus_game_then_start)
         self._update_status()
 
     def stop(self):
@@ -616,8 +657,65 @@ class App:
         if self.start_job is not None:
             self.root.after_cancel(self.start_job)
             self.start_job = None
+        self.focus_attempts = 0
+        self.focus_locked = False
         self.running = False
         self.wake_event.set()
+        self._show_window()
+        self._update_status()
+
+    def _remember_foreground_window(self):
+        foreground = root_window_handle(user32.GetForegroundWindow())
+        if (
+            foreground
+            and foreground != self.window_handle
+            and user32.IsWindow(foreground)
+        ):
+            self.target_window = foreground
+
+    def _focus_game_then_start(self):
+        self.start_job = None
+        if self.closed:
+            return
+
+        target = self.target_window
+        if not target or not user32.IsWindow(target):
+            self._abort_start("游戏窗口已关闭，请重新进入游戏后再按 Home")
+            return
+
+        if user32.IsIconic(target):
+            user32.ShowWindow(target, SW_RESTORE)
+        user32.SetForegroundWindow(target)
+        self.start_job = self.root.after(
+            FOCUS_SETTLE_MS, self._confirm_game_focus
+        )
+        self._update_status()
+
+    def _confirm_game_focus(self):
+        self.start_job = None
+        if self.closed:
+            return
+
+        foreground = root_window_handle(user32.GetForegroundWindow())
+        if foreground == self.target_window:
+            self._start_running()
+            return
+
+        self.focus_attempts += 1
+        if self.focus_attempts >= FOCUS_MAX_ATTEMPTS:
+            self._abort_start("无法切回游戏，请点一下游戏后再按 Home")
+            return
+
+        self.start_job = self.root.after(
+            FOCUS_RETRY_MS, self._focus_game_then_start
+        )
+        self._update_status()
+
+    def _abort_start(self, message):
+        self.start_job = None
+        self.running = False
+        self.focus_locked = False
+        self.send_error = message
         self._show_window()
         self._update_status()
 
@@ -625,6 +723,7 @@ class App:
         self.start_job = None
         if self.closed:
             return
+        self.focus_locked = False
         self.running = True
         self.wake_event.set()
         self._update_status()
@@ -706,7 +805,7 @@ class App:
             self.status.config(text=self.send_error, style="Error.TLabel")
         elif self.start_job is not None:
             self.status.config(
-                text="● 正在启动...", style="Running.TLabel"
+                text="● 正在切回游戏...", style="Running.TLabel"
             )
         elif self.running:
             _, buff_snapshot, _ = self.runtime_config
@@ -745,6 +844,9 @@ class App:
         start_pressed = False
         stop_pressed = False
         while not self.stop_event.is_set():
+            # 启动切焦期间锁定目标，避免把短暂出现的任务栏误记为游戏。
+            if not self.focus_locked:
+                self._remember_foreground_window()
             start_state = user32.GetAsyncKeyState(START_VK) & 0x8000
             stop_state = user32.GetAsyncKeyState(STOP_VK) & 0x8000
             if start_state and not start_pressed:
@@ -838,8 +940,9 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
         pass
+    previous_foreground = root_window_handle(user32.GetForegroundWindow())
     root = tk.Tk()
-    App(root)
+    App(root, previous_foreground)
     root.mainloop()
 
 

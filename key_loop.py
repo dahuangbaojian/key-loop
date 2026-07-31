@@ -167,8 +167,10 @@ FUNCTION_BUFF_KEYS = tuple("F%d" % i for i in range(1, 13))
 NUMBER_BUFF_KEYS = tuple("1234567890")
 MOUSE_RIGHT = "鼠标右键"
 ATTACK_OPTIONS = (MOUSE_RIGHT,) + tuple(KEYBOARD_KEYS)
-TOGGLE_KEY = "Home"
-TOGGLE_VK = 0x24
+START_KEY = "Home"
+START_VK = 0x24
+STOP_KEY = "End"
+STOP_VK = 0x23
 KEY_HOLD_MS = 80
 KEY_HOLD_S = KEY_HOLD_MS / 1000.0
 MOUSE_HOLD_MS = 30
@@ -193,8 +195,9 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "key_loop_config.json")
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("KeyLoop 按键精灵 Lite")
+        root.title("KeyLoop 游戏辅助")
         root.resizable(False, False)
+        self._configure_styles()
 
         self.running = False
         self.closed = False
@@ -211,22 +214,26 @@ class App:
 
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
-        self.toggle_requested = threading.Event()
+        self.start_requested = threading.Event()
+        self.stop_requested = threading.Event()
 
         cfg = self.load_config()
 
-        frm = ttk.Frame(root, padding=12)
+        frm = ttk.Frame(root, padding=16, style="App.TFrame")
         frm.grid()
 
-        top = ttk.Frame(frm)
-        top.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        header = ttk.Frame(frm, style="App.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         ttk.Label(
-            top,
-            text=(
-                "开关键: %s    攻击: %.1f 秒/次    Buff 吟唱间隔: %.1f 秒"
-                % (TOGGLE_KEY, ATTACK_INTERVAL_S, BUFF_GAP_S)
-            ),
+            header,
+            text="KeyLoop 游戏辅助",
+            style="Title.TLabel",
         ).pack(side="left")
+        ttk.Label(
+            header,
+            text="%s 启动  ·  %s 停止" % (START_KEY, STOP_KEY),
+            style="Hotkey.TLabel",
+        ).pack(side="right")
 
         rows_cfg = cfg.get("rows") if isinstance(cfg.get("rows"), list) else []
         legacy_enabled_keys = {
@@ -253,12 +260,16 @@ class App:
         attack = cfg.get("attack_key", MOUSE_RIGHT)
         if attack not in ATTACK_OPTIONS:
             attack = MOUSE_RIGHT
-        attack_frame = ttk.LabelFrame(frm, text="攻击键", padding=8)
+        attack_frame = ttk.LabelFrame(
+            frm, text="攻击设置", padding=12, style="Section.TLabelframe"
+        )
         attack_frame.grid(
             row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8)
         )
         self.attack_var = tk.StringVar(value=attack)
-        ttk.Label(attack_frame, text="按键:").pack(side="left")
+        ttk.Label(
+            attack_frame, text="攻击键", style="Card.TLabel"
+        ).pack(side="left")
         ttk.Combobox(
             attack_frame,
             textvariable=self.attack_var,
@@ -268,27 +279,32 @@ class App:
         ).pack(side="left", padx=(6, 14))
         ttk.Label(
             attack_frame,
-            text="固定每 %.1f 秒触发一次" % ATTACK_INTERVAL_S,
+            text="每 %.1f 秒触发" % ATTACK_INTERVAL_S,
+            style="MutedCard.TLabel",
         ).pack(side="left")
 
-        combo_frame = ttk.LabelFrame(frm, text="Buff 组合", padding=8)
+        combo_frame = ttk.LabelFrame(
+            frm, text="Buff 设置", padding=12, style="Section.TLabelframe"
+        )
         combo_frame.grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8)
         )
         self.buff_interval_var = tk.StringVar(value=str(configured_interval))
-        ttk.Label(combo_frame, text="组合循环间隔(秒):").pack(side="left")
+        ttk.Label(
+            combo_frame, text="组合间隔（秒）", style="Card.TLabel"
+        ).pack(side="left")
         ttk.Entry(
             combo_frame, textvariable=self.buff_interval_var, width=10
         ).pack(side="left", padx=(6, 14))
         ttk.Label(
             combo_frame,
-            text="组合内按键依次触发，每个键留 %.1f 秒吟唱时间"
-            % BUFF_GAP_S,
+            text="按顺序执行 · 每键预留 %.1f 秒" % BUFF_GAP_S,
+            style="MutedCard.TLabel",
         ).pack(side="left")
 
         self.row_vars = []
 
-        groups = ttk.Frame(frm)
+        groups = ttk.Frame(frm, style="App.TFrame")
         groups.grid(row=3, column=0, columnspan=2, sticky="nsew")
         self._build_buff_group(
             groups,
@@ -305,7 +321,7 @@ class App:
             enabled_keys,
         )
 
-        bulk = ttk.Frame(frm)
+        bulk = ttk.Frame(frm, style="App.TFrame")
         bulk.grid(
             row=4,
             column=0,
@@ -314,33 +330,55 @@ class App:
             sticky="ew",
         )
         ttk.Button(
-            bulk, text="全部启用", command=lambda: self.set_all(True)
+            bulk,
+            text="全选 Buff",
+            command=lambda: self.set_all(True),
+            style="Secondary.TButton",
         ).pack(side="left", expand=True, fill="x", padx=(0, 4))
         ttk.Button(
-            bulk, text="全部停用", command=lambda: self.set_all(False)
+            bulk,
+            text="清空 Buff",
+            command=lambda: self.set_all(False),
+            style="Secondary.TButton",
         ).pack(side="left", expand=True, fill="x")
 
-        self.btn = ttk.Button(
-            frm, text="开始 (%s)" % TOGGLE_KEY, command=self.toggle
-        )
-        self.btn.grid(
+        actions = ttk.Frame(frm, style="App.TFrame")
+        actions.grid(
             row=5,
             column=0,
             columnspan=2,
-            pady=(6, 4),
+            pady=(10, 6),
             sticky="ew",
         )
+        self.start_btn = ttk.Button(
+            actions,
+            text="启动  %s" % START_KEY,
+            command=self.start,
+            style="Primary.TButton",
+        )
+        self.start_btn.pack(
+            side="left", expand=True, fill="x", padx=(0, 5)
+        )
+        self.stop_btn = ttk.Button(
+            actions,
+            text="停止  %s" % STOP_KEY,
+            command=self.stop,
+            style="Stop.TButton",
+        )
+        self.stop_btn.pack(
+            side="left", expand=True, fill="x", padx=(5, 0)
+        )
 
-        self.status = ttk.Label(frm, text="已停止", foreground="gray")
+        self.status = ttk.Label(
+            frm, text="● 已停止", style="Stopped.TLabel", anchor="center"
+        )
         self.status.grid(row=6, column=0, columnspan=2)
 
         ttk.Label(
             frm,
-            text=(
-                "提示: Home 开关键全局有效，开始后自动隐藏窗口\n"
-                "Buff 组合执行时自动暂停攻击，组合结束后自动恢复"
-            ),
-            foreground="#888",
+            text="%s 启动，%s 停止；启动后先执行 Buff，再自动攻击。"
+            % (START_KEY, STOP_KEY),
+            style="Footer.TLabel",
             justify="center",
         ).grid(
             row=7,
@@ -352,6 +390,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._sync_runtime_config()
+        self._update_status()
         self.worker_thread = threading.Thread(
             target=self.worker, name="key-scheduler", daemon=True
         )
@@ -362,20 +401,142 @@ class App:
         self.hotkey_thread.start()
         self.root.after(50, self._refresh_ui)
 
+    def _configure_styles(self):
+        """使用轻量配色改善 Tk 默认界面。"""
+
+        background = "#F3F6FB"
+        card = "#FFFFFF"
+        text = "#172033"
+        muted = "#64748B"
+        primary = "#2563EB"
+
+        self.root.configure(background=background)
+        self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
+
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("App.TFrame", background=background)
+        style.configure(
+            "Title.TLabel",
+            background=background,
+            foreground=text,
+            font=("Microsoft YaHei UI", 17, "bold"),
+        )
+        style.configure(
+            "Hotkey.TLabel",
+            background=background,
+            foreground=primary,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.configure(
+            "Section.TLabelframe",
+            background=card,
+            bordercolor="#DCE3EE",
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "Section.TLabelframe.Label",
+            background=background,
+            foreground=text,
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.configure("Card.TLabel", background=card, foreground=text)
+        style.configure(
+            "MutedCard.TLabel", background=card, foreground=muted
+        )
+        style.configure(
+            "Card.TCheckbutton", background=card, foreground=text
+        )
+        style.map(
+            "Card.TCheckbutton",
+            background=[("active", card)],
+        )
+        style.configure(
+            "Secondary.TButton",
+            background="#E8EEF8",
+            foreground=text,
+            borderwidth=0,
+            padding=(12, 7),
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("active", "#DCE6F5")],
+        )
+        style.configure(
+            "Primary.TButton",
+            background=primary,
+            foreground="#FFFFFF",
+            borderwidth=0,
+            padding=(14, 9),
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", "#1D4ED8"), ("disabled", "#AFC4EE")],
+        )
+        style.configure(
+            "Stop.TButton",
+            background="#E9EEF5",
+            foreground="#334155",
+            borderwidth=0,
+            padding=(14, 9),
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.map(
+            "Stop.TButton",
+            background=[("active", "#DCE3EC"), ("disabled", "#EEF2F7")],
+        )
+        style.configure(
+            "Running.TLabel",
+            background=background,
+            foreground="#15803D",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        style.configure(
+            "Stopped.TLabel", background=background, foreground=muted
+        )
+        style.configure(
+            "Error.TLabel", background=background, foreground="#DC2626"
+        )
+        style.configure(
+            "Footer.TLabel",
+            background=background,
+            foreground=muted,
+            font=("Microsoft YaHei UI", 9),
+        )
+
     def _build_buff_group(self, parent, column, title, keys, enabled_keys):
-        group = ttk.LabelFrame(parent, text=title, padding=8)
-        group.grid(row=0, column=column, padx=4, sticky="n")
-        ttk.Label(group, text="启用").grid(row=0, column=0, padx=4)
-        ttk.Label(group, text="按键").grid(row=0, column=1, padx=8)
+        parent.columnconfigure(column, weight=1)
+        group = ttk.LabelFrame(
+            parent, text=title, padding=10, style="Section.TLabelframe"
+        )
+        group.grid(row=0, column=column, padx=4, sticky="nsew")
+        ttk.Label(group, text="启用", style="MutedCard.TLabel").grid(
+            row=0, column=0, padx=6
+        )
+        ttk.Label(group, text="按键", style="MutedCard.TLabel").grid(
+            row=0, column=1, padx=12
+        )
 
         for row, key_name in enumerate(keys, start=1):
             enabled_var = tk.BooleanVar(value=key_name in enabled_keys)
 
-            ttk.Checkbutton(group, variable=enabled_var).grid(
+            ttk.Checkbutton(
+                group, variable=enabled_var, style="Card.TCheckbutton"
+            ).grid(
                 row=row, column=0
             )
-            ttk.Label(group, text=key_name, width=4, anchor="center").grid(
-                row=row, column=1, padx=8, pady=2
+            ttk.Label(
+                group,
+                text=key_name,
+                width=5,
+                anchor="center",
+                style="Card.TLabel",
+            ).grid(
+                row=row, column=1, padx=12, pady=3
             )
             self.row_vars.append((key_name, enabled_var))
 
@@ -433,29 +594,31 @@ class App:
             enabled_var.set(value)
         self._sync_runtime_config()
 
-    def toggle(self):
+    def start(self):
+        if self.closed or self.running or self.start_job is not None:
+            return
+
+        self.send_error = ""
+        self._sync_runtime_config()
+        self.save_config()
+        # 隐藏而不是最小化：最小化会激活 Windows 任务栏，导致
+        # 全屏游戏底部残留任务栏。隐藏后再给游戏恢复焦点的时间。
+        self.root.withdraw()
+        self.start_job = self.root.after(200, self._start_running)
+        self._update_status()
+
+    def stop(self):
         if self.closed:
             return
 
+        if not self.running and self.start_job is None:
+            return
         if self.start_job is not None:
             self.root.after_cancel(self.start_job)
             self.start_job = None
-            self._show_window()
-            self._update_status()
-            return
-
-        if self.running:
-            self.running = False
-            self.wake_event.set()
-            self._show_window()
-        else:
-            self.send_error = ""
-            self._sync_runtime_config()
-            self.save_config()
-            # 隐藏而不是最小化：最小化会激活 Windows 任务栏，导致
-            # 全屏游戏底部残留任务栏。隐藏后再给游戏恢复焦点的时间。
-            self.root.withdraw()
-            self.start_job = self.root.after(200, self._start_running)
+        self.running = False
+        self.wake_event.set()
+        self._show_window()
         self._update_status()
 
     def _start_running(self):
@@ -472,7 +635,7 @@ class App:
         self.root.after(50, self.root.focus_force)
 
     def _wait_buff_gap(self):
-        """等待固定 Buff 间隔，同时允许 Home 停止立即打断。"""
+        """等待固定 Buff 间隔，同时允许 End 停止立即打断。"""
 
         deadline = time.monotonic() + BUFF_GAP_S
         while self.running and not self.stop_event.is_set():
@@ -521,22 +684,30 @@ class App:
     def _refresh_ui(self):
         if self.closed:
             return
-        if self.toggle_requested.is_set():
-            self.toggle_requested.clear()
-            self.toggle()
+        if self.stop_requested.is_set():
+            self.stop_requested.clear()
+            self.start_requested.clear()
+            self.stop()
+        elif self.start_requested.is_set():
+            self.start_requested.clear()
+            self.start()
         self._sync_runtime_config()
         self._update_status()
         self.root.after(50, self._refresh_ui)
 
     def _update_status(self):
-        self.btn.config(
-            text=("停止 (%s)" if self.running else "开始 (%s)") % TOGGLE_KEY
-        )
+        active = self.running or self.start_job is not None
+        self.start_btn.config(state="disabled" if active else "normal")
+        self.stop_btn.config(state="normal" if active else "disabled")
 
         if self.config_error:
-            self.status.config(text=self.config_error, foreground="red")
+            self.status.config(text=self.config_error, style="Error.TLabel")
         elif self.send_error:
-            self.status.config(text=self.send_error, foreground="red")
+            self.status.config(text=self.send_error, style="Error.TLabel")
+        elif self.start_job is not None:
+            self.status.config(
+                text="● 正在启动...", style="Running.TLabel"
+            )
         elif self.running:
             _, buff_snapshot, _ = self.runtime_config
             suffix = (
@@ -545,12 +716,12 @@ class App:
                 else ""
             )
             self.status.config(
-                text="运行中... 攻击键 %s，Buff 组合 %d 个按键%s"
+                text="● 运行中 · 攻击键 %s · Buff %d 个%s"
                 % (self.attack_var.get(), len(buff_snapshot), suffix),
-                foreground="green",
+                style="Running.TLabel",
             )
         else:
-            self.status.config(text="已停止", foreground="gray")
+            self.status.config(text="● 已停止", style="Stopped.TLabel")
 
     def on_close(self):
         if self.closed:
@@ -571,14 +742,21 @@ class App:
     def hotkey_listener(self):
         """轮询热键，只通过 Event 通知 Tk 主线程。"""
 
-        pressed = False
+        start_pressed = False
+        stop_pressed = False
         while not self.stop_event.is_set():
-            state = user32.GetAsyncKeyState(TOGGLE_VK) & 0x8000
-            if state and not pressed:
-                pressed = True
-                self.toggle_requested.set()
-            elif not state:
-                pressed = False
+            start_state = user32.GetAsyncKeyState(START_VK) & 0x8000
+            stop_state = user32.GetAsyncKeyState(STOP_VK) & 0x8000
+            if start_state and not start_pressed:
+                start_pressed = True
+                self.start_requested.set()
+            elif not start_state:
+                start_pressed = False
+            if stop_state and not stop_pressed:
+                stop_pressed = True
+                self.stop_requested.set()
+            elif not stop_state:
+                stop_pressed = False
             self.stop_event.wait(0.05)
 
     def worker(self):

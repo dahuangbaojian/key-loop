@@ -17,8 +17,10 @@ Buff 区固定提供 F1~F12 和数字键 1~0，可勾选任意数量组成一个
 - Buff 组合期间暂停常规攻击并保持右键视角状态；组合完成后自动恢复
 - 全局热键固定为 Home 启动、End 停止，游戏内也可直接操作
 - 使用 Win32 `SendInput` 和扫描码发送按键
-- 键盘按住时长固定为 80 毫秒，鼠标右键按住时长固定为 30 毫秒
+- 键盘按住时长固定为 80 毫秒；鼠标右键按住 100 毫秒，并在按下期间轻微
+  移动后回到原位，以帮助游戏捕获输入
 - 开始后自动隐藏到后台，停止时自动恢复窗口，不激活 Windows 任务栏
+- 打包后的 exe 默认请求管理员权限，避免与管理员权限运行的游戏存在输入权限差异
 - 配置自动保存，并兼容旧版同目录配置
 - 每次按键都保证完整的按下时长并成对松开
 
@@ -47,7 +49,7 @@ python key_loop.py
 
 ```bat
 python -m pip install pyinstaller
-python -m PyInstaller -F -w -n KeyLoop key_loop.py
+python -m PyInstaller -F -w --uac-admin -n KeyLoop key_loop.py
 ```
 
 生成文件位于 `dist\KeyLoop.exe`。使用 exe 的用户不需要安装 Python。
@@ -55,7 +57,6 @@ python -m PyInstaller -F -w -n KeyLoop key_loop.py
 常用选项：
 
 - 自定义图标：增加 `-i icon.ico`
-- 默认请求管理员权限：增加 `--uac-admin`
 - 降低单文件打包的误报概率：把 `-F` 改成 `-D`
 
 ## 开发与测试

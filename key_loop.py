@@ -29,6 +29,7 @@ KEYEVENTF_SCANCODE = 0x0008
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
 GA_ROOT = 2
 SW_RESTORE = 9
 
@@ -147,19 +148,35 @@ def send_mouse_move(dx, dy):
     """发送相对鼠标移动，用于让游戏进入右键视角输入状态。"""
 
     union = InputUnion()
-    union.mi = MouseInput(dx, dy, 0, MOUSEEVENTF_MOVE, 0, 0)
+    flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE
+    union.mi = MouseInput(dx, dy, 0, flags, 0, 0)
     event = Input(INPUT_MOUSE, union)
     return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) == 1
 
 
+def send_mouse_nudge(wait):
+    """在按住右键时轻微移动并移回，触发游戏的鼠标输入捕获。"""
+
+    moved = send_mouse_move(MOUSE_NUDGE_PX, 0)
+    if not moved:
+        return False
+    wait(MOUSE_NUDGE_PAUSE_S)
+    moved_back = send_mouse_move(-MOUSE_NUDGE_PX, 0)
+    if not moved_back:
+        moved_back = send_mouse_move(-MOUSE_NUDGE_PX, 0)
+    return moved_back
+
+
 def send_right_click(hold_s, shutdown_event):
-    """发送一次完整右键点击。"""
+    """发送一次带视角输入触发的完整右键点击。"""
 
     pressed = send_mouse_event(MOUSEEVENTF_RIGHTDOWN)
+    nudged = False
     if pressed:
+        nudged = send_mouse_nudge(shutdown_event.wait)
         shutdown_event.wait(hold_s)
     released = send_mouse_event(MOUSEEVENTF_RIGHTUP)
-    return pressed and released
+    return pressed and nudged and released
 
 
 # ---------------- 按键与配置 ----------------
@@ -205,8 +222,11 @@ STOP_KEY = "End"
 STOP_VK = 0x23
 KEY_HOLD_MS = 80
 KEY_HOLD_S = KEY_HOLD_MS / 1000.0
-MOUSE_HOLD_MS = 30
+MOUSE_HOLD_MS = 100
 MOUSE_HOLD_S = MOUSE_HOLD_MS / 1000.0
+MOUSE_NUDGE_PX = 2
+MOUSE_NUDGE_PAUSE_MS = 10
+MOUSE_NUDGE_PAUSE_S = MOUSE_NUDGE_PAUSE_MS / 1000.0
 BUFF_MOUSE_CAPTURE_SETTLE_MS = 150
 BUFF_MOUSE_CAPTURE_SETTLE_S = BUFF_MOUSE_CAPTURE_SETTLE_MS / 1000.0
 DEFAULT_ATTACK_INTERVAL_S = 0.3
@@ -955,9 +975,7 @@ class App:
                         continue
 
                     # 右移再移回，光标位置不变，但可触发游戏的视角捕获。
-                    moved = send_mouse_move(1, 0)
-                    moved_back = send_mouse_move(-1, 0)
-                    if not moved or not moved_back:
+                    if not send_mouse_nudge(self.stop_event.wait):
                         self.send_error = "触发游戏视角输入失败"
                     self._wait_buff_key_interval(
                         BUFF_MOUSE_CAPTURE_SETTLE_S

@@ -10,7 +10,7 @@ echo [2/3] 安装 PyInstaller...
 python -m pip install pyinstaller || goto :error
 
 echo [3/3] 开始打包...
-python -m PyInstaller -F -w -n KeyLoop key_loop.py || goto :error
+python -m PyInstaller -F -w --uac-admin -n KeyLoop key_loop.py || goto :error
 
 echo.
 echo 打包完成! 生成文件: dist\KeyLoop.exe
